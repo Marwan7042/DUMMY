@@ -49,3 +49,6 @@ graphify-out/
 
 # Graph data (contains personal conversation history)
 graph/data/graph.json
+
+# Brain history (contains conversation history)
+brain/history/
