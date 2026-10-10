@@ -1553,15 +1553,15 @@ def view_plan() -> str:
 # =====================================================================
 # Core Tools
 # =====================================================================
+def assert_readable(filepath: str) -> None:
+    """Global check to block access to sensitive paths across all reading tools."""
+    if permission_broker.is_sensitive_path(filepath):
+        raise PermissionError(f"Permission denied: Access to sensitive path '{filepath}' is restricted.")
+
 def read_file(filepath: str) -> str:
     try:
         filepath = resolve_path(filepath)
-        
-        # Security check: block access to sensitive paths
-        for sensitive in permission_broker.SENSITIVE_READ_PATHS:
-            if filepath == sensitive or filepath.startswith(sensitive + "/"):
-                return f"Permission denied: Access to sensitive path '{filepath}' is restricted."
-
+        assert_readable(filepath)
         if not os.path.isfile(filepath):
             return f"Error: File not found: {filepath}"
 
@@ -1889,6 +1889,7 @@ def list_documents() -> str:
 def read_file_lines(filepath: str, start_line: int, end_line: int) -> str:
     try:
         filepath = resolve_path(filepath)
+        assert_readable(filepath)
         if not os.path.isfile(filepath):
             return f"Error: File not found: {filepath}"
         start_line = max(1, int(start_line))
@@ -1910,6 +1911,7 @@ def read_file_lines(filepath: str, start_line: int, end_line: int) -> str:
 def code_outline(filepath: str) -> str:
     try:
         filepath = resolve_path(filepath)
+        assert_readable(filepath)
         if not os.path.isfile(filepath):
             return f"Error: File not found: {filepath}"
         ext = os.path.splitext(filepath)[1].lower()
@@ -2029,6 +2031,7 @@ def calc(expression: str) -> str:
 def search_code(pattern: str, directory: str = ".", file_pattern: str = "") -> str:
     try:
         directory = resolve_path(directory)
+        assert_readable(directory)
         if not os.path.isdir(directory):
             return f"Error: Directory not found: {directory}"
         excludes = " ".join([f"--exclude-dir={d}" for d in [".git", "__pycache__", ".venv", "venv", "build", "llama.cpp", "graphify-out", ".gemini", ".dummy"]])

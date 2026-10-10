@@ -74,10 +74,10 @@ VOICE_CONFIG = Path(os.getenv("DUMMY_VOICE_CONFIG", str(Path.home() / ".dummy" /
 # load in the stack, so it lives where nothing else runs. The dGPU has the
 # LLM, the P-cores have TTS/whisper bursts, the E-cores have the wake word.
 WAKE_CORES = os.getenv("DUMMY_WAKE_CORES", "16-27")
-# Two-stage wake: the detector runs LOW (0.15) to catch any voice/tone saying
+# Two-stage wake: the detector runs MEDIUM (0.5) to catch any voice/tone saying
 # "Jarvis"; whisper then verifies the transcript actually contains the name
 # before anything happens. A false trigger just costs a silent second.
-WAKE_THRESHOLD = float(os.getenv("DUMMY_WAKE_THRESHOLD", "0.15"))
+WAKE_THRESHOLD = float(os.getenv("DUMMY_WAKE_THRESHOLD", "0.5"))
 WAKE_PATIENCE = int(os.getenv("DUMMY_WAKE_PATIENCE", "2"))
 WAKE_ECHO_GUARD = os.getenv("DUMMY_WAKE_ECHO_GUARD", "1") != "0"
 WAKE_TTS_TAIL = 0.8            # seconds after speech ends before wake resumes
@@ -248,49 +248,57 @@ _WAKE_ALIASES = {
 }
 
 
-def _word_is_wake(w: str) -> bool:
+def _word_is_wake(w: str, pos: int = 0) -> bool:
     """True if one word sounds like the wake name - tolerates whisper's
-    spellings ('Jerviz', 'Jarviss') AND non-English scripts (Arabic 'جارفز'),
-    which is how accented speech often comes back from transcription."""
-    raw = w.strip()
-    if "جارف" in raw:  # Arabic-script 'Jarvis' (jarvez/jarvis phonetics)
+    spellings ('Jerviz', 'Jarviss') AND non-English scripts (Arabic 'جارفز')."""
+    # Arabic-script 'Jarvis'
+    if re.search(r"ج\u0627?ر[فب]", w):
         return True
-    latin = re.sub(r"[^a-z]", "", raw.lower())
+    
+    latin = re.sub(r"[^a-z]", "", w.lower())
     if not latin:
         return False
-    if latin in _WAKE_ALIASES or latin.startswith(("jarv", "jerv")):
+    
+    # Strong matches
+    if latin.startswith(("jarv", "jerv")):
         return True
-    # Consonant-skeleton match: jarvis -> jrvs, jerviz -> jrvz. Must start
-    # with 'j' so words like 'nervous' (nrvs) or 'service' (srvc) can't pass.
+    
+    # Weak matches allowed only in first 2 words
+    _WEAK = {"travis", "harvis", "javis", "darvis", "garvis", "charvis", "jardis", "gervais"}
+    if pos < 2 and latin in _WEAK:
+        return True
+    
+    # Consonant-skeleton match
     skel = re.sub(r"[aeiouy]", "", latin)
     return skel.startswith("j") and difflib.SequenceMatcher(None, skel, "jrvs").ratio() >= 0.7
 
 
 def _looks_like_wake(text: str, head_words: int = 6) -> bool:
     """Does the transcript contain something that sounds like 'jarvis' in
-    the first few words? Stage-2 verification: the detector runs at a low
-    threshold to catch any voice/tone saying the name; this filter decides
-    if it was really him."""
-    return any(_word_is_wake(w) for w in text.split()[:head_words])
+    the first few words?"""
+    words = text.split()
+    return any(_word_is_wake(w, i) for i, w in enumerate(words[:head_words]))
 
 
-def _strip_wake_words(text: str) -> str:
+def _strip_wake_words(text: str) -> Optional[str]:
     """Remove the wake name and addressing. Handles both orders:
     'Jarvis, what time is it' -> 'what time is it'
     'What time is it, Jarvis?' -> 'What time is it' (trailing vocative)."""
+    _GREETINGS = {"hey", "hi", "hello", "ok", "okay", "yo"}
     words = text.split()
     for i, w in enumerate(words[:6]):
-        if _word_is_wake(w):
+        if _word_is_wake(w, i):
             after = words[i + 1:]
-            if not after and i > 0:
-                # Trailing vocative: the command came BEFORE the name.
-                return " ".join(words[:i]).strip().lstrip(" ,.:;-!?")
-            return " ".join(after).strip().lstrip(" ,.:;-!?")
-    # No wake word found (defensive): strip leading fillers only.
-    i = 0
-    while i < len(words) and re.sub(r"[^a-z]", "", words[i].lower()) in ("hey", "ok", "okay", "hi", "hello"):
-        i += 1
-    return " ".join(words[i:]).strip().lstrip(" ,.:;-!?")
+            if after:
+                # Found wake word with command following
+                return " ".join(after).strip().lstrip(" ,.:;-!?")
+            
+            # Found wake word at the end; command must be before it.
+            # Strip greetings from the beginning of the command.
+            before = [b for b in words[:i] if re.sub(r"[^a-z]", "", b.lower()) not in _GREETINGS]
+            return " ".join(before).strip().lstrip(" ,.:;-!?")
+            
+    return None
 
 
 class VoiceEngine:
@@ -323,7 +331,7 @@ class VoiceEngine:
         self.auto_submit = bool(cfg.get("auto_submit", True))
         self._wake_thread = None
         self._wake_stop = threading.Event()
-        self._pending_dictation = None
+        self._pending_dictation = deque(maxlen=20)
         self._pending_lock = threading.Lock()
         self._tts_tail_until = 0.0
         self._wake_gated = threading.Event()  # set while capturing, to gate detection
@@ -801,11 +809,17 @@ class VoiceEngine:
         self._wake_stop.set()
 
     def pop_pending_dictation(self):
-        """Thread-safe: returns (and clears) the last wake-word transcript."""
+        """Thread-safe: returns (and clears) the oldest wake-word transcript."""
         with self._pending_lock:
-            text = self._pending_dictation
-            self._pending_dictation = None
-            return text
+            try:
+                return self._pending_dictation.popleft()
+            except IndexError:
+                return None
+
+    def queue_dictation(self, text: str):
+        """Thread-safe: add a new transcript to the queue."""
+        with self._pending_lock:
+            self._pending_dictation.append(text)
 
     def _spawn_mic_stream(self):
         """Continuous 16kHz mono s16 raw mic stream on the wake cores."""
@@ -858,15 +872,25 @@ class VoiceEngine:
                     preroll.append(chunk)
                     energy = float(np.mean(np.abs(np.frombuffer(chunk, dtype="<i2"))))
                     ambient.append(energy)
+                    
+                    # Follow-up window: allow commands without wake word for 7s after speech.
+                    is_follow_up = (time.time() < self._tts_tail_until + 7.0)
+                    
                     # Gate: our own voice, manual recording, or wake disabled
                     if (not self.wake_enabled or self._wake_gated.is_set()
-                            or self._wake_speaking_guarded() or self.is_recording()):
+                            or (not is_follow_up and self._wake_speaking_guarded()) or self.is_recording()):
                         continue
-                    scores = m.predict(
-                        np.frombuffer(chunk, dtype="<i2"),
-                        patience={key: WAKE_PATIENCE},
-                        threshold={key: WAKE_THRESHOLD},
-                    )
+                    
+                    # Only run the expensive detector if not in a follow-up window
+                    if is_follow_up:
+                        scores = {key: WAKE_THRESHOLD}
+                    else:
+                        scores = m.predict(
+                            np.frombuffer(chunk, dtype="<i2"),
+                            patience={key: WAKE_PATIENCE},
+                            threshold={key: WAKE_THRESHOLD},
+                        )
+
                     if scores.get(key, 0) >= WAKE_THRESHOLD:
                         m.reset()
                         self.flush()  # barge-in: stop speaking instantly
