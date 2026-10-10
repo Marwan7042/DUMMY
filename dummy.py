@@ -782,6 +782,10 @@ def fetch_url(url: str) -> str:
     import urllib.request
     import urllib.error
     
+    # Security: Only allow http and https to prevent file:// attacks
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return f"Error: Invalid URL scheme. Only http:// and https:// are permitted for safety. URL: {url}"
+
     try:
         # Add User-Agent to avoid some server blocks
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -981,12 +985,13 @@ def write_file(filepath: str, content: str) -> str:
     """Overwrites or creates a file safely with transactional snapshotting and validation."""
     try:
         filepath = resolve_path(filepath)
+        
+        if not permission_broker.check_mutation(filepath, "write_file"):
+            return f"Permission denied: Modification of '{filepath}' was aborted by user."
+
         dir_path = os.path.dirname(filepath)
         if dir_path:
             os.makedirs(dir_path, exist_ok=True)
-
-        if not permission_broker.check_mutation(filepath, "write_file"):
-            return f"Permission denied: Modification of '{filepath}' was aborted by user."
 
         # Validate python syntax if target is .py
         if filepath.endswith(".py"):
@@ -1239,6 +1244,18 @@ class PermissionBroker:
         os.path.expanduser("~/.ssh"),
     ]
 
+    SENSITIVE_READ_PATHS = [
+        os.path.expanduser("~/.ssh"),
+        os.path.expanduser("~/keys.txt"),
+        os.path.expanduser("~/.env"),
+        os.path.expanduser("~/.bash_history"),
+    ]
+
+    SAFE_COMMANDS = {
+        "ls", "pwd", "git status", "grep", "cat", "whoami", "date", "echo",
+        "df", "du", "top", "ps", "hostname", "uname"
+    }
+
     def __init__(self):
         self.mode = "standard"  # 'standard' (ask destructive/sensitive), 'paranoid' (ask all), 'yolo' (auto-approve)
         # Per-thread consent for delegated background ("big brain") agents:
@@ -1255,7 +1272,9 @@ class PermissionBroker:
         return getattr(self._bg_consent, "value", None)
 
     def check_command(self, command: str) -> bool:
-        """Returns True if command execution is permitted."""
+        """Returns True if command execution is permitted.
+        Uses an allowlist for safe commands; everything else prompts.
+        """
         bg = self._bg_consent_state()
         if bg is not None:
             # Background agent: never prompt. Destructive commands are always
@@ -1265,6 +1284,12 @@ class PermissionBroker:
             return bg
 
         if self.mode == "yolo":
+            return True
+
+        # Check if the command starts with a safe utility.
+        # Simple check: is the first word in the safe list?
+        cmd_base = command.strip().split()[0].lower() if command.strip() else ""
+        if cmd_base in self.SAFE_COMMANDS and not self.DESTRUCTIVE_PATTERN.search(command):
             return True
 
         if self.mode == "paranoid" or self.DESTRUCTIVE_PATTERN.search(command):
@@ -1281,6 +1306,21 @@ class PermissionBroker:
                 return ans in ["y", "yes"]
             except (KeyboardInterrupt, EOFError):
                 return False
+
+        # For standard mode, prompt if it's not in the safe list
+        console.print()
+        console.print(Panel(
+            f"[bold yellow]⚠️  UNRECOGNIZED COMMAND DETECTED[/bold yellow]\n\n"
+            f"[yellow]{command}[/yellow]\n\n"
+            f"[dim]This command is not on the safe allowlist. Confirm to proceed.[/dim]",
+            title="[bold yellow]Security Guard[/bold yellow]",
+            border_style="yellow"
+        ))
+        try:
+            ans = console.input("[bold yellow]Authorize execution? [y/N]: [/bold yellow]").strip().lower()
+            return ans in ["y", "yes"]
+        except (KeyboardInterrupt, EOFError):
+            return False
 
         return True
 
@@ -1516,6 +1556,12 @@ def view_plan() -> str:
 def read_file(filepath: str) -> str:
     try:
         filepath = resolve_path(filepath)
+        
+        # Security check: block access to sensitive paths
+        for sensitive in permission_broker.SENSITIVE_READ_PATHS:
+            if filepath == sensitive or filepath.startswith(sensitive + "/"):
+                return f"Permission denied: Access to sensitive path '{filepath}' is restricted."
+
         if not os.path.isfile(filepath):
             return f"Error: File not found: {filepath}"
 

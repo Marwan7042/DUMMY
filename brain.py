@@ -69,25 +69,26 @@ class Brain:
         self.metadata_file.write_text(json.dumps(metadata, indent=2))
 
     def start_session(self, session_name: Optional[str] = None) -> str:
-        """Start a new conversation session."""
+        """Start a new conversation session. If session already exists, it is resumed."""
         session_id = self._get_session_id(session_name)
         metadata = self._load_metadata()
 
-        # Create session file
+        # Create session file if it doesn't exist
         session_path = self.history_dir / f"{session_id}.json"
-        session_data = {
-            "id": session_id,
-            "name": session_name or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "started": datetime.now().isoformat(),
-            "messages": [],
-            "context": {}
-        }
-        session_path.write_text(json.dumps(session_data, indent=2))
-
-        # FIX: key by session_id instead of clobbering the whole sessions dict
+        if not session_path.exists():
+            session_data = {
+                "id": session_id,
+                "name": session_name or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "started": datetime.now().isoformat(),
+                "messages": [],
+                "context": {}
+            }
+            session_path.write_text(json.dumps(session_data, indent=2))
+        
+        # Update metadata
         metadata["sessions"][session_id] = {
             "name": session_name or "Untitled",
-            "started": datetime.now().isoformat(),
+            "started": metadata["sessions"].get(session_id, {}).get("started", datetime.now().isoformat()),
             "last_accessed": datetime.now().isoformat()
         }
         metadata["total_conversations"] = len(metadata["sessions"])
