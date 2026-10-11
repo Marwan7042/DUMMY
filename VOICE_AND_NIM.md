@@ -69,10 +69,10 @@ gapless sentence-to-sentence audio. Barge-in is a **SIGUSR1** to the worker
 (instant kill of its player, no reload). Whisper runs 8 threads on a
 dedicated partition (16 threads measured *slower* — oversubscription) and
 is prewarmed at boot so the first "Jarvis" doesn't pay the model load.
-Mic capture stays I/O-bound on all P-cores. Silence end: 1.2s.
+Mic capture stays I/O-bound on all P-cores. Silence end: 0.9s.
 
 Measured detection: **two-stage**. Stage 1 is the openWakeWord detector at a
-LOW threshold (0.15, patience 2) — it fires on any voice, tone, or accent
+LOW threshold (0.2, patience 2) — it fires on any voice, tone, or accent
 saying "Jarvis" (or "Hey Jarvis"). Stage 2 verifies the whisper transcript
 actually contains the name (accent-tolerant: "Jerviz", "Jarviss", Arabic
 "جارفز" all pass; "service"/"nervous"/"harvest" are rejected) before anything
@@ -83,8 +83,23 @@ clipped name, and both orders work ("What time is it, Jarvis?" keeps the
 front). If you say only the name, he answers **"Yes, sir?"** and listens
 once more for the command.
 
+**Follow-up conversation (2026-10-10).** You don't repeat "Jarvis" every
+turn: after each reply finishes, a `DUMMY_FOLLOWUP_SECONDS` (default 6s)
+window opens where **plain speech** (no wake word) triggers capture —
+~240ms of sustained speech above the adaptive energy threshold is enough.
+The echo guard always applies while his own audio is still draining, and
+whisper junk/hallucinations ("thank you", "bye", <2 chars) are dropped in
+this window. The window closes once you've been heard; his next reply
+reopens it.
+
+**Voice barge-in mid-turn.** A wake/follow-up command captured while the
+model is mid-turn aborts the generation (the `_render_stream` chunk loop
+watches a `threading.Event`; partial tool calls are discarded, never
+executed), the speech stops, and the dictation lands in your prompt —
+auto-submitted by default.
+
 On detection it **stops Jarvis mid-sentence** (barge-in), records your
-command with energy-based endpointing (waits for speech, ends after 1.4s
+command with energy-based endpointing (waits for speech, ends after 0.9s
 silence, 25s cap), transcribes with whisper, and the transcript lands in
 your prompt — **auto-submitted** by default.
 
@@ -96,11 +111,34 @@ your prompt — **auto-submitted** by default.
 | `/voice voice en_GB-jarvis-medium` | switch instantly + persist |
 | `Ctrl+T` | manual push-to-talk (still there as backup) |
 
-Wake tuning (env): `DUMMY_WAKE_THRESHOLD` (0.15), `DUMMY_WAKE_PATIENCE` (2),
+Wake tuning (env): `DUMMY_WAKE_THRESHOLD` (0.2), `DUMMY_WAKE_PATIENCE` (2),
 `DUMMY_WAKE_CORES` (16-27), `DUMMY_WAKE_ECHO_GUARD` (1 — suppresses detection
 while Jarvis is speaking so he never hears himself; set 0 to allow
 interrupting his speech with the wake word), `DUMMY_WAKE_VAD_START/STOP`
-(energy floors; real thresholds adapt to ambient noise).
+(energy floors; real thresholds adapt to ambient noise),
+`DUMMY_FOLLOWUP_SECONDS` (6), `DUMMY_MIC_TARGET` (PipeWire source for the
+wake stream; empty = default).
+
+**True barge-in on speakers (echo cancellation).** With headphones the
+echo guard is unnecessary: run with `DUMMY_WAKE_ECHO_GUARD=0`. With
+speakers, create `~/.config/pipewire/pipewire.conf.d/echo-cancel.conf`:
+
+```
+context.modules = [
+  { name = libpipewire-module-echo-cancel
+    args = {
+      node.latency = 1024/48000
+      source.props = { node.name = "echo-cancel-source" }
+      sink.props   = { node.name = "echo-cancel-sink" }
+    }
+  }
+]
+```
+
+Restart PipeWire, make the echo-cancel sink the default output (so `pw-play`
+goes through it), then run with
+`DUMMY_MIC_TARGET=echo-cancel-source DUMMY_WAKE_ECHO_GUARD=0`. Check node
+names with `pw-cli ls Node` — they vary by version.
 
 **Known environment trap (fixed 2026-10-09):** Python 3.14 made `forkserver`
 the default multiprocessing start method on Linux, and `import openvino`
@@ -157,8 +195,9 @@ rigor untouched.
 
 Files: `voice.py` (engine: streaming sentence extractor, TTS pipeline
 queue/thread, recording, worker management), `voice_worker.py` (persistent
-`faster-whisper small` int8, stdlib `wave` decoding to sidestep a
-faster-whisper/av 19 API mismatch, ~1-3s per short clip hot).
+`faster-whisper small` int8, beam 1 + `no_speech_prob` filtering so
+near-silence never hallucinates "Thank you.", stdlib `wave` decoding to
+sidestep a faster-whisper/av 19 API mismatch, ~1-3s per short clip hot).
 
 Config: `DUMMY_VOICE_CORES` (default `0-15`), `DUMMY_PIPER_VOICE`,
 `DUMMY_WHISPER_MODEL` (default `small`), `DUMMY_VOICE_CONFIG`.

@@ -1374,6 +1374,19 @@ class PermissionBroker:
         except (KeyboardInterrupt, EOFError):
             return False
 
+    def is_sensitive_path(self, filepath: str) -> bool:
+        """True if filepath is (or lives inside) one of the sensitive read
+        paths (.ssh, keys.txt, .env, shell history). assert_readable() denies
+        these across all reading tools."""
+        try:
+            abs_path = os.path.abspath(os.path.expanduser(filepath))
+        except Exception:
+            return False
+        for p in self.SENSITIVE_READ_PATHS:
+            if abs_path == p or (os.path.isdir(p) and abs_path.startswith(p + os.sep)):
+                return True
+        return False
+
     def notify_mutation(self, tool_name: str, details: str):
         """Displays visual notice for mutating actions."""
         console.print(f"[bold yellow]📝 Mutation Action:[/bold yellow] [cyan]{tool_name}[/cyan] ({details})")
@@ -3163,6 +3176,16 @@ def _render_stream(response):
     with Live(render_output(reasoning_content, full_content), console=console, refresh_per_second=15) as live:
         try:
             for chunk in response:
+                # Voice barge-in: a wake-word command arrived mid-turn. Abort
+                # the generation; the dictation becomes the next input.
+                if voice_engine is not None and voice_engine.voice_interrupt.is_set():
+                    console.print("\n[yellow]🎙 Voice command - stopping.[/yellow]")
+                    voice_engine.flush()
+                    # Drop partial tool calls: executing a half-streamed
+                    # write_file/apply_diff could mutate files with truncated
+                    # content.
+                    return [], full_content, reasoning_content, timings, usage, True
+
                 if fd is not None:
                     try:
                         rlist, _, _ = select.select([sys.stdin], [], [], 0)
@@ -3582,8 +3605,12 @@ def chat():
             if str(selected) in SESSION_TITLES:
                 del SESSION_TITLES[str(selected)]
                 _save_session_titles(SESSION_TITLES)
-            
-            console.print(f"[bold red]Deleted session:[/bold red] {selected_name_for_display}")
+
+            deleted_label = next(
+                (label for sid, label in session_choices if sid == selected),
+                str(selected),
+            )
+            console.print(f"[bold red]Deleted session:[/bold red] {deleted_label}")
             
             # If you delete the session you are currently inside, wipe the context clean
             if current_session_id == selected:
@@ -3753,7 +3780,7 @@ def chat():
             sub = parts[1].lower() if len(parts) > 1 else ""
             if sub == "on":
                 nim_route = True
-                console.print(f"[green]☁️ Routing to NVIDIA NIM ({nim_model}) for subsequent turns.[/green]")
+                console.print(f"[green]☁️ Routing to NVIDIA NIM ({_nim_state['model']}) for subsequent turns.[/green]")
             elif sub == "off":
                 nim_route = False
                 console.print("[green]🖥️ Back to the local llama-server.[/green]")
@@ -3784,6 +3811,8 @@ def chat():
                     f"({_nim_state['model']} - direct, not added to the local conversation)[/dim]"
                 )
                 try:
+                    if voice_engine is not None:
+                        voice_engine.voice_interrupt.clear()  # fresh one-shot: re-arm
                     response = nim_client.chat.completions.create(
                         model=_nim_state["model"],
                         messages=[
@@ -3842,6 +3871,8 @@ def chat():
             console.print(f"[dim red]⚠️ Could not save message to session: {exc}[/dim red]")
 
         guardrail.reset_turn()
+        if voice_engine is not None:
+            voice_engine.voice_interrupt.clear()  # fresh turn: re-arm voice barge-in
         backend_label = " [dim]☁️ NIM[/dim]" if (nim_route and nim_client is not None) else ""
         console.print(f"\n[bold yellow]Dummy >[/bold yellow]{backend_label}")
 
@@ -3918,7 +3949,7 @@ def chat():
                 try:
                     response = nim_client.chat.completions.create(**nim_params)
                 except Exception as exc:
-                    console.print(f"[bold red]Error calling NVIDIA NIM ({nim_model}):[/bold red] {exc}")
+                    console.print(f"[bold red]Error calling NVIDIA NIM ({_nim_state['model']}):[/bold red] {exc}")
                     turn_done = True
                     continue
             else:

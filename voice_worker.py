@@ -115,9 +115,16 @@ def main() -> None:
             if audio is not None:
                 audio_arg = audio
             # vad_filter trims leading/trailing silence - much better for
-            # short push-to-talk recordings.
-            segments, info = model.transcribe(audio_arg, beam_size=5, vad_filter=True)
-            text = " ".join(seg.text for seg in segments).strip()
+            # short push-to-talk recordings. beam 1 is plenty for short
+            # commands and clearly faster than beam 5; disabling
+            # condition_on_previous_text stops hallucinations leaking
+            # across segments; high no_speech_prob segments are whisper
+            # hallucinating on silence ("Thank you." on a near-empty clip).
+            segments, info = model.transcribe(
+                audio_arg, beam_size=1, vad_filter=True,
+                condition_on_previous_text=False,
+            )
+            text = " ".join(s.text for s in segments if s.no_speech_prob < 0.6).strip()
             print(f"OK\t{text}", flush=True)
         except Exception as exc:
             print(f"ERR\t{type(exc).__name__}: {exc}", flush=True)

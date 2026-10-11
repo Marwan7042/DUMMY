@@ -41,6 +41,7 @@ import warnings
 import difflib
 from collections import deque
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -74,10 +75,12 @@ VOICE_CONFIG = Path(os.getenv("DUMMY_VOICE_CONFIG", str(Path.home() / ".dummy" /
 # load in the stack, so it lives where nothing else runs. The dGPU has the
 # LLM, the P-cores have TTS/whisper bursts, the E-cores have the wake word.
 WAKE_CORES = os.getenv("DUMMY_WAKE_CORES", "16-27")
-# Two-stage wake: the detector runs MEDIUM (0.5) to catch any voice/tone saying
+# Two-stage wake: the detector runs LOW (0.2) to catch any voice/tone saying
 # "Jarvis"; whisper then verifies the transcript actually contains the name
 # before anything happens. A false trigger just costs a silent second.
-WAKE_THRESHOLD = float(os.getenv("DUMMY_WAKE_THRESHOLD", "0.5"))
+# (0.5 missed many accented pronunciations; docs say 0.15, 0.2 is the
+# measured sweet spot that keeps whisper-verification cheap.)
+WAKE_THRESHOLD = float(os.getenv("DUMMY_WAKE_THRESHOLD", "0.2"))
 WAKE_PATIENCE = int(os.getenv("DUMMY_WAKE_PATIENCE", "2"))
 WAKE_ECHO_GUARD = os.getenv("DUMMY_WAKE_ECHO_GUARD", "1") != "0"
 WAKE_TTS_TAIL = 0.8            # seconds after speech ends before wake resumes
@@ -87,7 +90,23 @@ WAKE_VAD_START = float(os.getenv("DUMMY_WAKE_VAD_START", "150"))
 WAKE_VAD_STOP = float(os.getenv("DUMMY_WAKE_VAD_STOP", "100"))
 WAKE_MAX_UTTERANCE = 25.0
 WAKE_START_TIMEOUT = 5.0
-WAKE_SILENCE_END = 1.2
+WAKE_SILENCE_END = 0.9
+# Follow-up window: after Jarvis finishes a reply, plain speech (no wake
+# word) triggers capture for this many seconds, so a conversation doesn't
+# need "Jarvis" repeated every turn.
+FOLLOW_UP_SECONDS = float(os.getenv("DUMMY_FOLLOWUP_SECONDS", "6"))
+# PipeWire mic target for the wake stream (e.g. "echo-cancel-source" when
+# using libpipewire-module-echo-cancel; empty = default source).
+MIC_TARGET = os.getenv("DUMMY_MIC_TARGET", "")
+
+# Whisper hallucinations on near-silence ("Thank you." etc.) and other
+# junk transcripts that must never become a command.
+_WHISPER_JUNK = {"you", "thank you", "thanks for watching", "bye", "okay", "the end"}
+
+
+def _is_junk(text: str) -> bool:
+    t = re.sub(r"[^\w\s]", "", text.lower()).strip()
+    return len(t) < 2 or t in _WHISPER_JUNK
 
 
 def _openwakeword_model_path() -> str:
@@ -296,7 +315,9 @@ def _strip_wake_words(text: str) -> Optional[str]:
             # Found wake word at the end; command must be before it.
             # Strip greetings from the beginning of the command.
             before = [b for b in words[:i] if re.sub(r"[^a-z]", "", b.lower()) not in _GREETINGS]
-            return " ".join(before).strip().lstrip(" ,.:;-!?")
+            # The punctuation that preceded the vocative ("it, Jarvis")
+            # is not part of the command either.
+            return " ".join(before).strip().strip(" ,.:;-!?").strip()
             
     return None
 
@@ -333,8 +354,16 @@ class VoiceEngine:
         self._wake_stop = threading.Event()
         self._pending_dictation = deque(maxlen=20)
         self._pending_lock = threading.Lock()
-        self._tts_tail_until = 0.0
+        # Echo guard / follow-up timing. `_audio_end` estimates when the
+        # speaker actually falls silent (the TTS worker hands audio to the
+        # player long before it finishes draining); `_follow_up_until` opens
+        # the no-wake-word window after a reply.
+        self._audio_end = 0.0
+        self._follow_up_until = 0.0
         self._wake_gated = threading.Event()  # set while capturing, to gate detection
+        # Set by the wake thread when a voice command arrives mid-turn so the
+        # chat loop can abort the in-flight generation (voice barge-in).
+        self.voice_interrupt = threading.Event()
         if self.tts_enabled:
             self.toggle_tts(True)  # restores + starts the speaker thread
         if self.wake_enabled:
@@ -450,6 +479,7 @@ class VoiceEngine:
         try:
             while True:
                 self._tts_q.get_nowait()
+                self._tts_q.task_done()
         except queue.Empty:
             pass
         # Worker mode: SIGUSR1 makes the worker kill its player instantly -
@@ -474,7 +504,7 @@ class VoiceEngine:
                             proc.kill()
                         except Exception:
                             pass
-        self._tts_tail_until = time.time() + 0.5
+        self._audio_end = time.time()
 
     def _drain_sentences(self, final: bool = False) -> None:
         buf = self._feed_buf
@@ -499,16 +529,39 @@ class VoiceEngine:
         self._feed_buf = ("" if final else leftover) + held
 
     # --------------------------------------------------------- TTS engine --
+    def _is_speaking(self) -> bool:
+        """True while our own audio is queued, synthesizing, or still draining
+        out of the speaker. Reliable even before the worker starts playing
+        (the queue count covers the say->DONE latency)."""
+        return (self._tts_q.unfinished_tasks > 0          # queued OR in flight
+                or self._current_procs is not None
+                or time.time() < self._audio_end + WAKE_TTS_TAIL)
+
+    def _note_audio(self, pcm_bytes: int) -> None:
+        """Record that `pcm_bytes` of PCM were handed to the player, and
+        estimate when they will have finished being heard."""
+        # Pipe writes block once ~64KB is buffered, so at DONE only about that
+        # much (+ player buffer) is still audible.
+        now = time.time()
+        dur = pcm_bytes / (2.0 * max(self.voice_rate, 1))
+        cap = 65536 / (2.0 * max(self.voice_rate, 1))
+        self._audio_end = now + min(max(self._audio_end - now, 0) + dur, cap) + 0.3
+        self._follow_up_until = self._audio_end + FOLLOW_UP_SECONDS
+        self.last_spoke_at = now
+
     def _tts_loop(self) -> None:
         while True:
             text = self._tts_q.get()
-            self._speak_stream(text)
+            try:
+                self._speak_stream(text)
+            finally:
+                self._tts_q.task_done()
 
     def _speak_stream(self, text: str) -> None:
         """Speak one sentence through the persistent TTS worker (model hot,
         zero spawn overhead per sentence). Falls back to the one-shot piper
         CLI pipeline if the worker is unavailable. Runs in the TTS thread."""
-        if not os.path.isfile(PIPER_BIN) or not os.path.isfile(self.voice_path):
+        if not os.path.isfile(self.voice_path):
             return
         try:
             w = self._ensure_tts_worker()
@@ -525,24 +578,24 @@ class VoiceEngine:
                     sys.stderr.write(f"[voice] tts worker: {err[:200]}\n")
                     if w.poll() is not None:
                         self._kill_tts_worker()
-                    # Echo-guard: estimate remaining drain time from the byte
-                    # count the worker reports (DONE <bytes>), plus a tail.
-                    self._tts_tail_until = time.time() + WAKE_TTS_TAIL
                     return
-                # DONE <bytes> -> keep the wake detector deaf while the audio
-                # is still draining out of the player, not just while we feed it.
+                # DONE <bytes> -> estimate when the audio has finished
+                # draining out of the player (echo guard + follow-up window).
                 try:
                     sent = int(ack.split()[1])
                 except Exception:
                     sent = 0
-                drain = sent / (2.0 * max(self.voice_rate, 1))
-                self._tts_tail_until = time.time() + drain + WAKE_TTS_TAIL
-                self.last_spoke_at = time.time()
+                self._note_audio(sent)
                 return
             except Exception as exc:
                 sys.stderr.write(f"[voice] tts worker write failed: {type(exc).__name__}: {exc}\n")
                 self._kill_tts_worker()
         # -------- fallback: one-shot piper CLI pipeline (always works) ------
+        # Only this path needs the piper binary; the worker above uses the
+        # Python API.
+        if not os.path.isfile(PIPER_BIN):
+            sys.stderr.write("[voice] tts worker unavailable and piper binary not found\n")
+            return
         self._speak_cli_fallback(text)
 
     def _speak_cli_fallback(self, text: str) -> None:
@@ -630,7 +683,7 @@ class VoiceEngine:
                 )
                 sys.stderr.flush()
             # Echo guard tail: hold wake detection briefly after speech ends.
-            self._tts_tail_until = time.time() + WAKE_TTS_TAIL
+            self._audio_end = time.time()
         except Exception as exc:
             sys.stderr.write(f"[voice] tts failed: {type(exc).__name__}: {exc}\n")
             sys.stderr.flush()
@@ -822,22 +875,25 @@ class VoiceEngine:
             self._pending_dictation.append(text)
 
     def _spawn_mic_stream(self):
-        """Continuous 16kHz mono s16 raw mic stream on the wake cores."""
+        """Continuous 16kHz mono s16 raw mic stream on the wake cores.
+        DUMMY_MIC_TARGET selects the PipeWire source (e.g. the echo-cancel
+        source); empty = system default."""
+        cmd = ["taskset", "-c", WAKE_CORES, "pw-record"]
+        if MIC_TARGET:
+            cmd += ["--target", MIC_TARGET]
+        cmd += ["--raw", "--rate", "16000", "--channels", "1", "--format", "s16", "-"]
         return subprocess.Popen(
-            ["taskset", "-c", WAKE_CORES, "pw-record", "--raw",
-             "--rate", "16000", "--channels", "1", "--format", "s16", "-"],
+            cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=WAKE_MIC_CHUNK,
         )
 
     def _wake_speaking_guarded(self) -> bool:
-        """True while our own TTS is speaking (echo guard) or during manual
-        push-to-talk - detection is suppressed then, so Jarvis never hears
-        himself. Disable with DUMMY_WAKE_ECHO_GUARD=0."""
-        if not WAKE_ECHO_GUARD:
-            return False
-        return (self._current_procs is not None) or (time.time() < self._tts_tail_until)
+        """True while our own TTS is speaking (echo guard) - detection is
+        suppressed then, so Jarvis never hears himself. Disable with
+        DUMMY_WAKE_ECHO_GUARD=0 (headphones or PipeWire echo cancellation)."""
+        return WAKE_ECHO_GUARD and self._is_speaking()
 
     def _wake_loop(self) -> None:
         # Cosmetic: onnxruntime warns about the (intentionally hidden) CUDA
@@ -865,48 +921,55 @@ class VoiceEngine:
             proc = None
             try:
                 proc = self._spawn_mic_stream()
+                voice_run = 0
                 while not self._wake_stop.is_set():
                     chunk = proc.stdout.read(WAKE_MIC_CHUNK)
                     if not chunk or len(chunk) < WAKE_MIC_CHUNK:
                         break  # stream died - fall through to respawn
                     preroll.append(chunk)
                     energy = float(np.mean(np.abs(np.frombuffer(chunk, dtype="<i2"))))
-                    ambient.append(energy)
-                    
-                    # Follow-up window: allow commands without wake word for 7s after speech.
-                    is_follow_up = (time.time() < self._tts_tail_until + 7.0)
-                    
-                    # Gate: our own voice, manual recording, or wake disabled
+                    speaking = self._is_speaking()
+                    if not speaking:
+                        ambient.append(energy)  # never learn "ambient" from his own voice
+
                     if (not self.wake_enabled or self._wake_gated.is_set()
-                            or (not is_follow_up and self._wake_speaking_guarded()) or self.is_recording()):
+                            or self.is_recording() or (WAKE_ECHO_GUARD and speaking)):
+                        voice_run = 0
                         continue
-                    
-                    # Only run the expensive detector if not in a follow-up window
-                    if is_follow_up:
-                        scores = {key: WAKE_THRESHOLD}
+
+                    follow_up = time.time() < self._follow_up_until
+                    amb = float(np.percentile(ambient, 10)) if ambient else 0.0
+                    if follow_up:
+                        # Plain speech (no wake word) triggers capture in the
+                        # window right after he finishes speaking.
+                        voice_run = voice_run + 1 if energy > max(WAKE_VAD_START, amb * 2.5) else 0
+                        triggered = voice_run >= 3     # ~240ms of sustained speech
                     else:
                         scores = m.predict(
                             np.frombuffer(chunk, dtype="<i2"),
                             patience={key: WAKE_PATIENCE},
                             threshold={key: WAKE_THRESHOLD},
                         )
+                        triggered = scores.get(key, 0) >= WAKE_THRESHOLD
+                    if not triggered:
+                        continue
 
-                    if scores.get(key, 0) >= WAKE_THRESHOLD:
-                        m.reset()
-                        self.flush()  # barge-in: stop speaking instantly
-                        # The detector fires mid-word: carry the pre-trigger
-                        # audio (the start of "Jarvis" itself) into the capture
-                        # so run-on commands aren't clipped.
-                        seed = b"".join(preroll)
-                        preroll.clear()
-                        print(f"\033[96m🎙  wake candidate - verifying...\033[0m", file=sys.stderr, flush=True)
-                        try:
-                            amb = float(np.percentile(ambient, 10)) if ambient else 0.0
-                            self._wake_capture_and_transcribe(proc.stdout, amb, seed=seed)
-                        except Exception as exc:
-                            # The ear must never die: log and keep listening.
-                            print(f"\033[91m🎙  wake capture failed: {type(exc).__name__}: {exc}\033[0m", file=sys.stderr, flush=True)
-                        m.reset()
+                    voice_run = 0
+                    m.reset()
+                    self.flush()  # barge-in: stop speaking instantly
+                    # The detector fires mid-word: carry the pre-trigger audio
+                    # (the start of "Jarvis" itself) into the capture so run-on
+                    # commands aren't clipped. Short seed in follow-up mode so
+                    # we don't re-capture the tail of his own voice.
+                    seed = b"".join(list(preroll)[-(6 if follow_up else 16):])
+                    preroll.clear()
+                    print("\033[96m🎙  listening...\033[0m", file=sys.stderr, flush=True)
+                    try:
+                        self._wake_capture_and_transcribe(proc.stdout, amb, seed=seed, follow_up=follow_up)
+                    except Exception as exc:
+                        # The ear must never die: log and keep listening.
+                        print(f"\033[91m🎙  wake capture failed: {type(exc).__name__}: {exc}\033[0m", file=sys.stderr, flush=True)
+                    m.reset()
             except Exception as exc:
                 print(f"[voice] wake listener hiccup ({type(exc).__name__}: {exc}) - restarting stream", file=sys.stderr, flush=True)
             finally:
@@ -918,13 +981,16 @@ class VoiceEngine:
             if not self._wake_stop.is_set():
                 self._wake_stop.wait(2.0)  # brief backoff, then respawn the stream
 
-    def _wake_capture_and_transcribe(self, stream, ambient: float = 0.0, seed: bytes = b"") -> None:
+    def _wake_capture_and_transcribe(self, stream, ambient: float = 0.0, seed: bytes = b"",
+                                      follow_up: bool = False) -> None:
         """Two-stage wake. Stage 1 (cheap, always-on): the openWakeWord
         detector at a LOW threshold - any voice or tone saying "Jarvis"
-        triggers. Stage 2 (here): capture, transcribe, and VERIFY the
-        transcript really contains the name before anything happens; a
-        false trigger costs one silent second. If the user said only the
-        name, answer "Yes, sir?" and listen once more for the command.
+        triggers (or, right after he spoke, plain speech in the follow-up
+        window). Stage 2 (here): capture, transcribe, and VERIFY the
+        transcript really contains the name (or isn't junk) before anything
+        happens; a false trigger costs one silent second. If the user said
+        only the name, answer "Yes, sir?" and listen once more for the
+        command.
 
         `seed` is the pre-roll audio from just before the trigger (the
         start of the wake word itself), so run-on commands keep the name.
@@ -941,31 +1007,36 @@ class VoiceEngine:
             text = self._transcribe_pcm(pcm)
             if not text:
                 return
-            if not _looks_like_wake(text):
-                # Low-threshold false positive: discard silently.
-                print(f"\033[90m🎙  (not a wake phrase: {text[:60]})\033[0m", file=sys.stderr, flush=True)
+            has_wake = _looks_like_wake(text)
+            if not has_wake and (not follow_up or _is_junk(text)):
+                # Low-threshold false positive / whisper hallucination: discard.
+                print(f"\033[90m🎙  (ignored: {text[:60]})\033[0m", file=sys.stderr, flush=True)
                 return
-            remainder = _strip_wake_words(text)
-            if not remainder:
+
+            remainder = _strip_wake_words(text) if has_wake else text
+            if not remainder and has_wake:
                 # He only said the name. Answer like JARVIS, then listen for
                 # the actual command (waiting out our own voice first).
                 print("\033[96m🎙  summoned - answering 'Yes, sir?' and listening\033[0m", file=sys.stderr, flush=True)
                 self.speak("Yes, sir?")
                 deadline = time.time() + 8.0
-                while time.time() < self._tts_tail_until and time.time() < deadline:
-                    time.sleep(0.1)
+                time.sleep(0.05)
+                while self._is_speaking() and time.time() < deadline:
+                    time.sleep(0.05)
                 pcm2 = self._capture_speech(stream, max_sec=15.0, ambient=ambient)
                 if pcm2:
                     text2 = self._transcribe_pcm(pcm2)
-                    if text2:
-                        remainder = _strip_wake_words(text2)
+                    if text2 and not _is_junk(text2):
+                        remainder = _strip_wake_words(text2) or text2
+
             if remainder:
-                with self._pending_lock:
-                    self._pending_dictation = remainder
+                self.queue_dictation(remainder)
+                self.voice_interrupt.set()  # abort any in-flight turn (barge-in)
                 print(f"\033[96m🎙  heard: {remainder}\033[0m", file=sys.stderr, flush=True)
             else:
                 print("\033[90m🎙  (nothing intelligible)\033[0m", file=sys.stderr, flush=True)
         finally:
+            self._follow_up_until = 0.0  # his next reply reopens the window
             self._wake_gated.clear()
 
     def _transcribe_pcm(self, pcm: bytes):
@@ -1044,6 +1115,7 @@ class VoiceEngine:
             f"Switch with /voice voice <name> (e.g. en_GB-jarvis-high)\n"
             f"Wake word: {'ON - just say \"Jarvis\"' if self.wake_enabled and self._wake_thread and self._wake_thread.is_alive() else 'OFF'}"
             f" (two-stage: detector {WAKE_THRESHOLD} -> whisper-verified, cores {WAKE_CORES})\n"
+            f"Follow-up window: {FOLLOW_UP_SECONDS:.0f}s after each reply - plain speech, no wake word needed\n"
             f"Auto-submit dictation: {'ON' if self.auto_submit else 'OFF'}\n"
             f"Whisper model: {os.getenv('DUMMY_WHISPER_MODEL', 'small')} (int8, CPU)\n"
             f"Pinned cores: TTS {TTS_CORES} | whisper {WHISPER_CORES} | "
